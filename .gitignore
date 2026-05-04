@@ -7,8 +7,10 @@ dist/
 *.spec
 
 .tmp/
+.test-output/
 *.log
 agent.md
 
 # Local Word templates and generated documents should not be committed by default.
 *.docx
+*.dotx
