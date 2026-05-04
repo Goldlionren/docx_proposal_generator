@@ -386,7 +386,7 @@ def compose_without_word(front_template_path, body_docx_path, output_docx_path, 
         marker_paragraph._element.getparent().remove(marker_paragraph._element)
 
         doc.save(temp_output)
-        replace_placeholders_in_docx_package(temp_output, metadata)
+        patch_ooxml_placeholders(temp_output, temp_output, metadata, log)
         merge_docx_media_relationships(temp_output, body_docx_path, output_path)
         log(
             "Microsoft Word was not available. Generated DOCX with a TOC field, "
@@ -438,7 +438,7 @@ def convert_dotx_to_docx_package(dotx_path, docx_path):
             output_zip.writestr(name, data)
 
 
-def replace_placeholders_in_docx_package(docx_path, replacements):
+def patch_ooxml_placeholders(input_path, output_path, replacements, log=None):
     safe_replacements = {
         placeholder: value
         for placeholder, value in replacements.items()
@@ -447,13 +447,18 @@ def replace_placeholders_in_docx_package(docx_path, replacements):
     if not safe_replacements:
         return
 
-    path = Path(docx_path)
-    temp_path = path.with_suffix(".replace.tmp.docx")
-    with ZipFile(path, "r") as source_zip:
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    write_path = output_path
+    if input_path.resolve() == output_path.resolve():
+        write_path = output_path.with_suffix(f".ooxml-patched.tmp{output_path.suffix}")
+
+    replacements_made = 0
+    with ZipFile(input_path, "r") as source_zip:
         entries = {name: source_zip.read(name) for name in source_zip.namelist()}
 
     for name, data in list(entries.items()):
-        if not (name.startswith("word/") and name.endswith(".xml")):
+        if not (name.endswith(".xml") or name.endswith(".rels")):
             continue
 
         try:
@@ -463,16 +468,26 @@ def replace_placeholders_in_docx_package(docx_path, replacements):
 
         new_text = text
         for placeholder, value in safe_replacements.items():
-            new_text = new_text.replace(placeholder, escape_xml_text(value))
+            count = new_text.count(placeholder)
+            if count:
+                new_text = new_text.replace(placeholder, escape_xml_text(value))
+                replacements_made += count
 
         if new_text != text:
             entries[name] = new_text.encode("utf-8")
 
-    with ZipFile(temp_path, "w", ZIP_DEFLATED) as output_zip:
+    with ZipFile(write_path, "w", ZIP_DEFLATED) as output_zip:
         for name, data in entries.items():
             output_zip.writestr(name, data)
 
-    temp_path.replace(path)
+    if write_path != output_path:
+        write_path.replace(output_path)
+
+    if log:
+        log(
+            "OOXML placeholder patch complete: "
+            f"{replacements_made} replacement(s) written to {output_path}"
+        )
 
 
 def escape_xml_text(value):
@@ -853,9 +868,26 @@ class DOCXProposalGenerator(tk.Tk):
         version_line = check_pandoc_version(pandoc_path)
         self.log(f"Pandoc available: {version_line}")
         self.log(f"Pandoc path: {pandoc_path}")
+        self.log("Metadata values received from GUI:")
+        self.log(f"Client Name: {metadata['{{CLIENT_NAME}}'] or '(blank)'}")
+        self.log(f"Document Name: {metadata['{{DOCUMENT_NAME}}'] or '(blank)'}")
+        self.log(f"Author: {metadata['{{AUTHOR}}'] or '(blank)'}")
 
         with tempfile.TemporaryDirectory(prefix="docx_proposal_") as temp_dir:
-            body_docx = str(Path(temp_dir) / "body.docx")
+            temp_path = Path(temp_dir)
+            body_docx = str(temp_path / "body.docx")
+            source_front_template = Path(front_template_docx)
+            patched_front_template = (
+                temp_path / f"patched_{source_front_template.stem}{source_front_template.suffix}"
+            )
+            patch_ooxml_placeholders(
+                source_front_template,
+                patched_front_template,
+                metadata,
+                self.log,
+            )
+            self.log(f"Patched front matter template path: {patched_front_template}")
+
             pandoc_command, pandoc_result = convert_markdown_to_docx(
                 pandoc_path,
                 source_markdown,
@@ -876,24 +908,26 @@ class DOCXProposalGenerator(tk.Tk):
             try:
                 self.log("Composing final DOCX with Microsoft Word automation.")
                 compose_with_word(
-                    front_template_docx,
+                    patched_front_template,
                     body_docx,
                     output_docx,
                     metadata,
                     self.log,
                 )
+                self.apply_final_ooxml_safety_patch(output_docx, metadata)
                 self.log(f"Success. DOCX generated at: {output_docx}")
                 messagebox.showinfo("Success", "DOCX generated successfully.")
             except Exception as word_exc:
                 self.log(f"Word automation unavailable or failed: {word_exc}")
                 self.log("Falling back to python-docx composition.")
                 compose_without_word(
-                    front_template_docx,
+                    patched_front_template,
                     body_docx,
                     output_docx,
                     metadata,
                     self.log,
                 )
+                self.apply_final_ooxml_safety_patch(output_docx, metadata)
                 self.log(f"Success with warning. DOCX generated at: {output_docx}")
                 messagebox.showwarning(
                     "Generated With Warning",
@@ -901,6 +935,13 @@ class DOCXProposalGenerator(tk.Tk):
                     "the TOC, fields, and page numbers. Open the document in Word "
                     "and update fields if needed.",
                 )
+
+    def apply_final_ooxml_safety_patch(self, output_docx, metadata):
+        output_path = Path(output_docx)
+        temp_output = output_path.with_suffix(".ooxml-safety.tmp.docx")
+        patch_ooxml_placeholders(output_path, temp_output, metadata, self.log)
+        temp_output.replace(output_path)
+        self.log("Final OOXML safety replacement completed.")
 
     def _is_file(self, path):
         return bool(path) and os.path.isfile(path)
